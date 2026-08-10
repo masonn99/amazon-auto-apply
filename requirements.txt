@@ -1,0 +1,6 @@
+py-cord>=2.0.0
+selenium>=4.0.0
+undetected-chromedriver>=3.5.0
+webdriver-manager>=4.0.0
+python-decouple>=3.8
+requests>=2.31.0

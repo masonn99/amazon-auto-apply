@@ -101,6 +101,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Amazon job apply state/screenshots
+amazon/
+
 # Environments
 .env
 .venv

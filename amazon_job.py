@@ -29,6 +29,8 @@ LOGIN_URL = "https://passport.amazon.jobs/"
 SEARCH_URL = "https://www.amazon.jobs/en/search.json"
 SEARCH_COUNTRY = "USA"
 SEARCH_QUERIES = ["Software Development Engineer II", "SDE2", "SDE II"]
+APPLICATIONS_DASHBOARD_URL = "https://www.amazon.jobs/applicant/dashboard/applications"
+ACTIVE_APPLICATION_CAP = 10
 # Anchored to this file's own location (not the shell's cwd) so the Chrome
 # profile — and thus the logged-in session — is found consistently no matter
 # where this script gets launched from. A cwd-relative path here would silently
@@ -80,10 +82,25 @@ def main():
     try:
         login(driver)
 
-        for job in new_jobs:
-            submit_job_application(driver, job)
+        active_count = get_active_application_count(driver)
+        print(f"[apply] {active_count}/{ACTIVE_APPLICATION_CAP} active applications before this run.")
+
+        for i, job in enumerate(new_jobs):
+            if active_count >= ACTIVE_APPLICATION_CAP:
+                remaining = len(new_jobs) - i
+                print(f"[apply] at the {ACTIVE_APPLICATION_CAP} active-application cap — "
+                      f"stopping, {remaining} job(s) left for a future run.")
+                send_discord(
+                    f"Hit the {ACTIVE_APPLICATION_CAP} active-application cap — {remaining} matching "
+                    "job(s) left unprocessed, will pick them up automatically once you have room."
+                )
+                break
+
+            submitted = submit_job_application(driver, job)
             seen_ids.add(job["id_icims"])
             save_seen_ids(seen_ids)
+            if submitted:
+                active_count += 1
     except Exception:
         driver.save_screenshot(join(AMAZON_DIR, "debug_crash.png"))
         print(f"[debug] crashed at url={driver.current_url} title={driver.title!r}")
@@ -548,7 +565,28 @@ def find_submit_button(driver):
     return els[0] if els else None
 
 
+def get_active_application_count(driver):
+    # The dashboard's own "Active (N)" tab is the ground truth for how many
+    # applications count against Amazon's cap — more reliable than trying to
+    # classify each application card's status text ourselves.
+    driver.get(APPLICATIONS_DASHBOARD_URL)
+    wait_until(driver, page_loaded=True)
+    time.sleep(2)
+    text = driver.execute_script(
+        'const el = document.getElementById("active-tab-desktop"); return el ? el.textContent : null;'
+    )
+    if text is None:
+        raise RuntimeError("Couldn't find the Active applications tab on the dashboard.")
+    match = re.search(r"\((\d+)\)", text)
+    if not match:
+        raise RuntimeError(f"Couldn't parse active application count from: {text!r}")
+    return int(match.group(1))
+
+
 def submit_job_application(driver, job):
+    # Returns True if this call resulted in a real submission, False otherwise
+    # (already applied, or something prevented reaching the submit button) —
+    # callers use this to track how much room is left under the active cap.
     driver.get(job["url_next_step"])
     wait_until(driver, page_loaded=True)
     time.sleep(2)
@@ -557,7 +595,7 @@ def submit_job_application(driver, job):
 
     if "result=duplicate" in driver.current_url:
         print(f"[apply] already applied to {job['id_icims']}, skipping.")
-        return
+        return False
 
     # Step budget: generous upper bound on how many panels this wizard can have,
     # so a stuck/unexpected panel can't spin the loop forever.
@@ -578,27 +616,22 @@ def submit_job_application(driver, job):
         if not click_continue(driver):
             break
 
-    screenshot_path = debug_dump(driver, f"before_submit_{job['id_icims']}")
-    send_discord(
-        f"Ready to submit: **{job['title']}** — {job['normalized_location']}\n{job_url}",
-        path=screenshot_path,
-    )
-    reply = ask_discord_question("Reply +submit to actually submit this application, or +skip to leave it for you to finish manually.")
-
-    if reply.strip().lower().lstrip('+') != 'submit':
-        send_discord(f"Skipped — left open for you to finish: {job['url_next_step']}")
-        return
-
     submit_btn = find_submit_button(driver)
     if not submit_btn:
-        send_discord("Couldn't find the Submit button — application left open for you to finish.")
-        return
+        screenshot_path = debug_dump(driver, f"stuck_{job['id_icims']}")
+        send_discord(
+            f"Couldn't find the Submit button for **{job['title']}** — left open for you to finish: "
+            f"{job['url_next_step']}",
+            path=screenshot_path,
+        )
+        return False
 
     submit_btn.click()
     wait_until(driver, page_loaded=True)
     time.sleep(2)
-    debug_dump(driver, f"submitted_{job['id_icims']}")
-    send_discord(f"Submitted: **{job['title']}** — {job_url}")
+    screenshot_path = debug_dump(driver, f"submitted_{job['id_icims']}")
+    send_discord(f"Submitted: **{job['title']}** — {job['normalized_location']}\n{job_url}", path=screenshot_path)
+    return True
 
 
 def dump_full_page(driver, step_dir):
@@ -626,6 +659,17 @@ def capture_application_flow(driver, start_url):
         if cmd == "done":
             break
         step += 1
+
+
+def run_check_applications():
+    makedirs(AMAZON_DIR, exist_ok=True)
+    driver = browser_options(True)
+    try:
+        login(driver, target_url=APPLICATIONS_DASHBOARD_URL)
+        count = get_active_application_count(driver)
+        print(f"[apply] {count}/{ACTIVE_APPLICATION_CAP} active applications.")
+    finally:
+        driver.quit()
 
 
 def run_capture():
@@ -925,11 +969,16 @@ if __name__ == '__main__':
                            default=None,
                            help='Specific job application URL to use with --capture '
                                 '(defaults to the first new SDE2 match).')
+    my_parser.add_argument('--check-applications',
+                           action='store_true',
+                           help='Log in, print the current active/cap application count, and exit.')
 
     options = my_parser.parse_args()
     options = vars(options)
 
     if options['capture']:
         run_capture()
+    elif options['check_applications']:
+        run_check_applications()
     else:
         main()

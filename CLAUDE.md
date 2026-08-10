@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file (`amazon_job.py`) Selenium bot that finds new SDE2 job postings on amazon.jobs, logs into the user's Amazon.jobs account (MFA/OTP relayed through a Discord bot), fills out the multi-step application form, and submits it — fully autonomously, up to a self-imposed active-application cap. There is no test suite, build step, or lint config; this is a personal automation script, not a package.
+A single-file (`amazon_job.py`) Selenium bot that finds new SDE2 job postings on amazon.jobs, logs into the user's Amazon.jobs account (OTP read automatically from Gmail via IMAP — no human in the loop), fills out the multi-step application form, and submits it — fully autonomously, up to a self-imposed active-application cap. Discord is still used for submission notifications and for asking about unrecognized job-specific questions, but no longer for OTP. There is no test suite, build step, or lint config; this is a personal automation script, not a package.
 
 ## Running it
 
@@ -37,7 +37,7 @@ Everything lives in `amazon_job.py`, organized as one pipeline: **search → log
 Hits the public, unauthenticated `amazon.jobs/en/search.json` API directly — no browser needed for this part. Filters titles with `SDE2_TITLE_RE` / excludes `EXCLUDE_TITLE_RE` (drops Senior/III/Principal/Manager/Intern/Lead), then filters by `posted_date`. `main()` diffs the result against `amazon/seen_jobs.json` (persisted, id_icims-keyed) so re-runs only touch new postings.
 
 ### 2. Login (`login`)
-`account.amazon.jobs` / `passport.amazon.jobs` is a server-rendered Rails app with React islands, not a SPA — pages are real navigations. `login(driver, target_url=...)` navigates straight to the *target* page (e.g. a specific job's apply URL) rather than the generic login page first, so Amazon's own post-auth redirect lands back on that target instead of the candidate homepage. If the persistent Chrome profile already has a valid session, Amazon skips the login form entirely and `login()` returns immediately (`"[login] already authenticated"`) — no OTP needed. When login *is* required, it fills the form via `set_input_value` (bypasses `send_keys` — see comment in code for why), submits, then blocks on `send_discord(..., wait_for_otp=True)` until the user replies in Discord with `+<code>`.
+`account.amazon.jobs` / `passport.amazon.jobs` is a server-rendered Rails app with React islands, not a SPA — pages are real navigations. `login(driver, target_url=...)` navigates straight to the *target* page (e.g. a specific job's apply URL) rather than the generic login page first, so Amazon's own post-auth redirect lands back on that target instead of the candidate homepage. If the persistent Chrome profile already has a valid session, Amazon skips the login form entirely and `login()` returns immediately (`"[login] already authenticated"`) — no OTP needed. When login *is* required, it fills the form via `set_input_value` (bypasses `send_keys` — see comment in code for why), submits, then resolves the OTP via `fetch_otp_from_gmail()`: polls Gmail (IMAP, `GMAIL_APP_PASSWORD`, required) for a new email from `noreply@mail.amazon.jobs` newer than `otp_request_ts` (captured *before* the submit click, with a 30s buffer — capturing it after risks rejecting the real code as "stale" if the email's server timestamp lands earlier than the capture point), regex-extracts the code. No Discord fallback — `login()` raises if Gmail doesn't produce a code within the timeout.
 
 **Session persistence**: `CHROME_PROFILE_DIR` (and every other `amazon/...` path) is anchored to `dirname(abspath(__file__))`, not the shell's cwd — a cwd-relative path here would silently start a fresh empty profile (and force OTP again) on any run launched from a different directory. Even with a stable profile, Amazon's own auth cookie (`mons_auth` / `__Host-mons-sidp`) expires roughly every 24h server-side, so periodic OTP re-auth is expected behavior, not a bug.
 
@@ -66,6 +66,7 @@ Not part of the apply pipeline — a debugging tool for when Amazon changes the 
 
 ## Known limitations
 
-- Job-specific questions that are neither a Yes/No nor a fully-parseable experience range still block indefinitely on a Discord reply — there's no timeout/skip.
+- Job-specific questions that are neither a Yes/No nor a fully-parseable experience range still block indefinitely on a Discord reply — there's no timeout/skip. This is the one remaining path that can stall a fully unattended (e.g. cron) run even with Gmail OTP configured.
 - `find_submit_button` matches any button containing "Submit" — broad by design since the exact final-review button hasn't been captured for every job variant.
 - Assumes job-specific questions are always select2 dropdowns (true for every job seen so far); a radio-button-based job-specific question would need a new handler.
+- `fetch_otp_from_gmail` matches on sender `noreply@mail.amazon.jobs` and the phrase `"code on amazon.jobs: <digits>"` — if Amazon changes that email's wording, `OTP_CODE_RE` needs updating; since there's no Discord fallback anymore, a mismatch here means `login()` raises instead of degrading gracefully.

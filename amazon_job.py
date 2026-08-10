@@ -1,10 +1,13 @@
 import asyncio
+import email
+import imaplib
 import json
 import re
 import time
 import traceback
 from argparse import ArgumentParser
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from os import makedirs
 from os.path import abspath, dirname, exists, join
 
@@ -23,7 +26,11 @@ AMAZON_EM = config('AMAZON_EM')
 AMAZON_PW = config('AMAZON_PW')
 DISC_KEY = config('DISC_KEY')
 DISC_CHANNEL = int(config('DISC_CHANNEL'))
-OTP_CODE = "+"
+# OTP is read straight out of Gmail via IMAP — see fetch_otp_from_gmail(). No
+# Discord fallback: login() raises if this isn't configured or no matching
+# email shows up in time.
+GMAIL_EM = config('GMAIL_EM', default=AMAZON_EM)
+GMAIL_APP_PASSWORD = config('GMAIL_APP_PASSWORD', default=None)
 
 LOGIN_URL = "https://passport.amazon.jobs/"
 SEARCH_URL = "https://www.amazon.jobs/en/search.json"
@@ -31,6 +38,10 @@ SEARCH_COUNTRY = "USA"
 SEARCH_QUERIES = ["Software Development Engineer II", "SDE2", "SDE II"]
 APPLICATIONS_DASHBOARD_URL = "https://www.amazon.jobs/applicant/dashboard/applications"
 ACTIVE_APPLICATION_CAP = 10
+GMAIL_IMAP_HOST = "imap.gmail.com"
+OTP_EMAIL_SENDER = "noreply@mail.amazon.jobs"
+OTP_EMAIL_SUBJECT = "verification code"
+OTP_CODE_RE = re.compile(r"code on amazon\.jobs:\s*(\d{4,8})")
 # Anchored to this file's own location (not the shell's cwd) so the Chrome
 # profile — and thus the logged-in session — is found consistently no matter
 # where this script gets launched from. A cwd-relative path here would silently
@@ -179,7 +190,7 @@ def debug_dump(driver, label):
     print("[debug] inputs:", driver.execute_script(
         "return Array.from(document.querySelectorAll('input')).map(el => "
         "({id: el.id, name: el.name, type: el.type, placeholder: el.placeholder, "
-        "value: el.type === 'file' ? undefined : el.value, checked: el.checked}));"
+        "value: (el.type === 'file' || el.type === 'password') ? undefined : el.value, checked: el.checked}));"
     ))
     print("[debug] selects:", driver.execute_script(
         "return Array.from(document.querySelectorAll('select')).map(el => "
@@ -214,6 +225,67 @@ def set_input_value(driver, element, value):
     )
 
 
+def extract_otp_code(text):
+    text = re.sub(r"<[^>]+>", " ", text)  # in case only the HTML part is available
+    match = OTP_CODE_RE.search(text)
+    return match.group(1) if match else None
+
+
+def get_email_body_text(msg):
+    if not msg.is_multipart():
+        return msg.get_payload(decode=True).decode(errors="ignore")
+    for wanted_type in ("text/plain", "text/html"):
+        for part in msg.walk():
+            if part.get_content_type() == wanted_type:
+                return part.get_payload(decode=True).decode(errors="ignore")
+    return ""
+
+
+def check_gmail_for_otp(since_ts):
+    # Returns the OTP code from the newest matching email received after
+    # since_ts, or None if nothing new has arrived yet.
+    conn = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+    try:
+        conn.login(GMAIL_EM, GMAIL_APP_PASSWORD)
+        conn.select("INBOX")
+        status, data = conn.search(None, f'(FROM "{OTP_EMAIL_SENDER}" SUBJECT "{OTP_EMAIL_SUBJECT}")')
+        if status != "OK" or not data or not data[0]:
+            return None
+        # Check the handful of most recent matches, newest first, in case
+        # more than one arrived close together.
+        for msg_id in reversed(data[0].split()[-5:]):
+            status, msg_data = conn.fetch(msg_id, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            msg_date = parsedate_to_datetime(msg["Date"])
+            if msg_date.timestamp() < since_ts:
+                continue  # older than this login attempt — a stale code
+            code = extract_otp_code(get_email_body_text(msg))
+            if code:
+                return code
+        return None
+    finally:
+        conn.logout()
+
+
+def fetch_otp_from_gmail(since_ts, timeout=90, poll_interval=4):
+    if not GMAIL_APP_PASSWORD:
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            code = check_gmail_for_otp(since_ts)
+        except Exception as e:
+            print(f"[login] Gmail OTP check failed ({e!r}), falling back to Discord.")
+            return None
+        if code:
+            return code
+        time.sleep(poll_interval)
+    print("[login] no OTP email showed up in Gmail within the timeout, falling back to Discord.")
+    return None
+
+
 def login(driver, target_url=None):
     # Navigating straight to the target job/application URL (instead of the bare
     # LOGIN_URL) lets Amazon's own auth redirect remember where to send us back
@@ -238,6 +310,14 @@ def login(driver, target_url=None):
             f'document.querySelector("#loginFormPasswordInputField").value == "{AMAZON_PW}"')
     )
 
+    # Captured *before* the click that actually triggers Amazon's OTP email —
+    # capturing it after wait_until below (as this used to) left a window where
+    # the email's server timestamp could land earlier than since_ts, causing
+    # fetch_otp_from_gmail to wrongly reject the real code as stale every poll.
+    # The extra 30s buffer also covers clock skew between this machine and
+    # Gmail's server-reported Date header.
+    otp_request_ts = time.time() - 30
+
     # A bare button[type="submit"] selector grabs whichever matching button is
     # first in the DOM — the page also has unrelated submit buttons (e.g. a
     # dismissible browser-compatibility banner), so match by visible text instead.
@@ -246,13 +326,14 @@ def login(driver, target_url=None):
     # the verification-code screen's own text rather than document.readyState.
     wait_until(driver, text="Enter verification code")
 
-    send_discord(
-        "Amazon.jobs emailed you a verification code — check your inbox and reply "
-        "here with it, prefixed with +, like +123456",
-        wait_for_otp=True,
-    )
+    otp = fetch_otp_from_gmail(since_ts=otp_request_ts)
+    if not otp:
+        raise RuntimeError(
+            "Couldn't get the OTP from Gmail — check GMAIL_APP_PASSWORD in .env and that "
+            "the verification email actually arrived."
+        )
+    print("[login] got the OTP from Gmail automatically.")
 
-    otp = OTP_CODE.replace("+", "").replace(" ", "")
     otp_field = driver.find_element(By.ID, "verificationFormCodeInputField")
     set_input_value(driver, otp_field, otp)
     wait_until(
@@ -357,6 +438,12 @@ def ask_discord_question(prompt):
         await bot.close()
 
     bot.run(DISC_KEY)
+    # bot.close() returns before the underlying aiohttp session/socket has
+    # fully torn down; if the process exits immediately after (e.g. this was
+    # the last thing main() did), that teardown races interpreter shutdown
+    # and prints harmless but alarming "Unclosed client session" / "Event
+    # loop is closed" noise. Give it a beat to finish first.
+    time.sleep(0.5)
     return answer.get('text', '')
 
 
@@ -721,7 +808,7 @@ def run_capture():
         driver.quit()
 
 
-def send_discord(content, path=None, wait_for_otp=False):
+def send_discord(content, path=None):
     # bot.run() closes its event loop on exit; since this gets called once per
     # job notification, force a fresh loop each time or subsequent calls die
     # with "Event loop is closed".
@@ -739,24 +826,15 @@ def send_discord(content, path=None, wait_for_otp=False):
                 await channel.send(content=content, file=discord.File(f))
         else:
             await channel.send(content=content)
-        if not wait_for_otp:
-            await bot.close()
-
-    if wait_for_otp:
-        @bot.event
-        async def on_message(message):
-            channel = bot.get_channel(DISC_CHANNEL)
-            if bot.user == message.author:
-                return
-            if message.content.startswith("+"):
-                global OTP_CODE
-                OTP_CODE = message.content
-                await channel.send(f"Got your OTP code {OTP_CODE}, thanks.")
-                await bot.close()
-            else:
-                await channel.send(f"Nope, please enter it starting with a + sign. Like +{message.content}")
+        await bot.close()
 
     bot.run(DISC_KEY)
+    # bot.close() returns before the underlying aiohttp session/socket has
+    # fully torn down; if the process exits immediately after (e.g. this was
+    # the last thing main() did), that teardown races interpreter shutdown
+    # and prints harmless but alarming "Unclosed client session" / "Event
+    # loop is closed" noise. Give it a beat to finish first.
+    time.sleep(0.5)
 
 
 def browser_options(undetected=False):

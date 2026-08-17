@@ -3,12 +3,13 @@ import email
 import imaplib
 import json
 import re
+import subprocess
 import time
 import traceback
 from argparse import ArgumentParser
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
-from os import makedirs
+from os import kill, makedirs, readlink, remove
 from os.path import abspath, dirname, exists, join
 
 import discord
@@ -52,6 +53,7 @@ SEEN_JOBS_PATH = join(AMAZON_DIR, "seen_jobs.json")
 CHROME_PROFILE_DIR = join(AMAZON_DIR, "chrome_profile")
 CAPTURE_DIR = join(AMAZON_DIR, "capture")
 JOB_QA_PATH = join(AMAZON_DIR, "job_qa.json")
+CHROME_BINARY_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # Fixed answers for the two Work Eligibility fields that aren't already carried
 # over from the profile (everything else on that panel defaults correctly).
@@ -107,10 +109,14 @@ def main():
                 )
                 break
 
-            submitted = submit_job_application(driver, job)
-            seen_ids.add(job["id_icims"])
-            save_seen_ids(seen_ids)
-            if submitted:
+            result = submit_job_application(driver, job)
+            # "stuck" means the wizard hit an unhandled panel and never reached
+            # Submit — leave it unmarked so a future run (ideally after the panel
+            # gets a handler) retries it instead of silently losing it forever.
+            if result != "stuck":
+                seen_ids.add(job["id_icims"])
+                save_seen_ids(seen_ids)
+            if result == "submitted":
                 active_count += 1
     except Exception:
         driver.save_screenshot(join(AMAZON_DIR, "debug_crash.png"))
@@ -321,7 +327,36 @@ def login(driver, target_url=None):
     # A bare button[type="submit"] selector grabs whichever matching button is
     # first in the DOM — the page also has unrelated submit buttons (e.g. a
     # dismissible browser-compatibility banner), so match by visible text instead.
-    driver.find_element(By.XPATH, '//button[normalize-space(.)="Log in to your account settings"]').click()
+    # The label itself varies by how this page was reached: landing here via a
+    # target_url redirect shows plain "Log in", landing on the bare LOGIN_URL
+    # shows "Log in to your account settings" — contains() catches both since
+    # the longer form starts with the shorter one.
+    driver.find_element(
+        By.XPATH, '//button[contains(normalize-space(.), "Log in")]').click()
+    wait_until(driver, page_loaded=True)
+    time.sleep(2)
+
+    if "optionalMfaReminder" in driver.current_url:
+        # Amazon added this MFA-enrollment nag screen between password submit and
+        # the OTP screen at some point after this was first written — it's not
+        # part of the actual login flow, so dismiss it via its "Skip for now"
+        # link rather than enabling MFA.
+        driver.find_element(By.ID, "bypassOptionalMfaButton").click()
+        wait_until(driver, page_loaded=True)
+        time.sleep(2)
+
+    if "passport.amazon.jobs" not in driver.current_url:
+        # Skipping the MFA reminder can land straight on the authenticated
+        # dashboard instead of an OTP challenge — e.g. when this Chrome profile's
+        # device is still trusted from a recent login. No verification code
+        # screen to wait for in that case; login is already done.
+        print(f"[login] authenticated without an OTP challenge, url={driver.current_url}")
+        debug_dump(driver, "post_login")
+        if target_url and target_url not in driver.current_url:
+            driver.get(target_url)
+            wait_until(driver, page_loaded=True)
+        return
+
     # This portal swaps in the next screen via JS on the same page, so wait for
     # the verification-code screen's own text rather than document.readyState.
     wait_until(driver, text="Enter verification code")
@@ -628,6 +663,25 @@ def answer_work_eligibility(driver):
             print(f"[apply] WARNING: couldn't confirm {name}={value} got selected.")
 
 
+def skip_sms_notifications(driver):
+    # This panel's advance control is an <a id="save-and-continue-form-button">
+    # reading "Skip & continue", not a <button> with text "Continue" — click_continue's
+    # selector doesn't match it. Clicking it both dismisses the phone-verification
+    # prompt and advances to the next panel in one action, so there's nothing else
+    # to answer here and the caller shouldn't also call click_continue afterward.
+    prev_panel = get_active_panel(driver)
+    prev_id = prev_panel['id'] if prev_panel else None
+    driver.find_element(By.ID, "save-and-continue-form-button").click()
+    timer = 0
+    while timer < 15:
+        panel = get_active_panel(driver)
+        if not panel or panel['id'] != prev_id:
+            return
+        time.sleep(1)
+        timer += 1
+    raise TimeoutError("Clicked Skip & continue on SMS Notifications but the panel never changed.")
+
+
 def click_continue(driver):
     buttons = driver.find_elements(
         By.XPATH, '//div[@role="tabpanel" and contains(@class,"active")]//button[normalize-space(.)="Continue"]'
@@ -671,9 +725,9 @@ def get_active_application_count(driver):
 
 
 def submit_job_application(driver, job):
-    # Returns True if this call resulted in a real submission, False otherwise
-    # (already applied, or something prevented reaching the submit button) —
-    # callers use this to track how much room is left under the active cap.
+    # Returns "submitted" (a real submission happened), "duplicate" (already
+    # applied — safe to mark seen), or "stuck" (an unhandled panel blocked the
+    # wizard — caller should leave it unmarked so a future run retries it).
     driver.get(job["url_next_step"])
     wait_until(driver, page_loaded=True)
     time.sleep(2)
@@ -682,7 +736,7 @@ def submit_job_application(driver, job):
 
     if "result=duplicate" in driver.current_url:
         print(f"[apply] already applied to {job['id_icims']}, skipping.")
-        return False
+        return "duplicate"
 
     # Step budget: generous upper bound on how many panels this wizard can have,
     # so a stuck/unexpected panel can't spin the loop forever.
@@ -694,6 +748,11 @@ def submit_job_application(driver, job):
             answer_job_specific_questions(driver, panel['id'])
         elif panel['label'] == "Work Eligibility":
             answer_work_eligibility(driver)
+        elif panel['label'] == "SMS Notifications":
+            # Its own "Skip & continue" control already advances the wizard —
+            # skip the click_continue() call below for this iteration.
+            skip_sms_notifications(driver)
+            continue
         # Other panels (contact info, general questions, education, resume,
         # acknowledgement, ID verification, EEO/disability/veteran self-ID)
         # already carry over pre-filled/completed from the candidate profile.
@@ -707,18 +766,18 @@ def submit_job_application(driver, job):
     if not submit_btn:
         screenshot_path = debug_dump(driver, f"stuck_{job['id_icims']}")
         send_discord(
-            f"Couldn't find the Submit button for **{job['title']}** — left open for you to finish: "
-            f"{job['url_next_step']}",
+            f"Couldn't find the Submit button for **{job['title']}** — will retry automatically "
+            f"on a future run once this is fixed, or finish it yourself: {job['url_next_step']}",
             path=screenshot_path,
         )
-        return False
+        return "stuck"
 
     submit_btn.click()
     wait_until(driver, page_loaded=True)
     time.sleep(2)
     screenshot_path = debug_dump(driver, f"submitted_{job['id_icims']}")
     send_discord(f"Submitted: **{job['title']}** — {job['normalized_location']}\n{job_url}", path=screenshot_path)
-    return True
+    return "submitted"
 
 
 def dump_full_page(driver, step_dir):
@@ -837,6 +896,57 @@ def send_discord(content, path=None):
     time.sleep(0.5)
 
 
+def detect_chrome_major_version():
+    # When uc.Chrome() isn't given version_main, undetected-chromedriver's
+    # patcher.fetch_release_number() fetches whatever Google's "Stable" channel
+    # catalog currently reports as latest — it never actually inspects the
+    # Chrome binary installed on this machine. If the catalog has moved ahead
+    # of this machine's not-yet-auto-updated Chrome (they update on
+    # independent schedules), that downloads a driver newer than the local
+    # browser and every session crashes with SessionNotCreatedException.
+    # Detecting and pinning the real installed version keeps them in sync.
+    try:
+        output = subprocess.run(
+            [CHROME_BINARY_PATH, "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+        match = re.search(r"(\d+)\.\d+\.\d+\.\d+", output)
+        return int(match.group(1)) if match else None
+    except Exception as e:
+        print(f"[browser] couldn't detect installed Chrome version ({e!r}), "
+              "falling back to undetected-chromedriver's default (latest known-good driver).")
+        return None
+
+
+def clear_stale_chrome_lock():
+    # Chrome's persistent-profile "single instance" guard is a SingletonLock
+    # symlink pointing at "<hostname>-<pid>" of the process holding the
+    # profile. If a prior run was killed (timeout, crash, Ctrl-C) instead of
+    # exiting cleanly, that symlink survives and points at a PID that's no
+    # longer running. Chrome normally detects and clears a stale lock itself,
+    # but under undetected-chromedriver's launch path that check can lose the
+    # race, leaving the new session to hang forever on navigation (readyState
+    # never reaches "complete") instead of raising. Since the target PID is
+    # confirmed dead here, it's safe to clear these ourselves before launch.
+    lock_path = join(CHROME_PROFILE_DIR, "SingletonLock")
+    if not exists(lock_path):
+        return
+    try:
+        target = readlink(lock_path)
+        pid = int(target.rsplit("-", 1)[-1])
+        kill(pid, 0)
+        return  # PID is alive — a real Chrome instance owns this profile.
+    except ProcessLookupError:
+        pass  # PID is dead — the lock is stale, safe to clear.
+    except (OSError, ValueError):
+        pass  # Malformed symlink/target — can't confirm liveness, clear it.
+    print("[browser] clearing stale Chrome SingletonLock from a previous run.")
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            remove(join(CHROME_PROFILE_DIR, name))
+        except FileNotFoundError:
+            pass
+
+
 def browser_options(undetected=False):
     headless = True
     if options['show']:
@@ -869,10 +979,13 @@ def browser_options(undetected=False):
     })
 
     makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+    clear_stale_chrome_lock()
 
     if undetected:
+        chrome_version = detect_chrome_major_version()
         driver = uc.Chrome(suppress_welcome=False, options=chrome_options,
-                            user_data_dir=CHROME_PROFILE_DIR)
+                            user_data_dir=CHROME_PROFILE_DIR,
+                            version_main=chrome_version or 0)
     else:
         chrome_options.add_argument(f'--user-data-dir={CHROME_PROFILE_DIR}')
         driver = webdriver.Chrome(service=Service(

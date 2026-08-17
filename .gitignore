@@ -104,6 +104,9 @@ celerybeat.pid
 # Amazon job apply state/screenshots
 amazon/
 
+# Microsoft job search state
+microsoft/
+
 # Environments
 .env
 .venv

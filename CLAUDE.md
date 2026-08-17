@@ -70,3 +70,6 @@ Not part of the apply pipeline — a debugging tool for when Amazon changes the 
 - `find_submit_button` matches any button containing "Submit" — broad by design since the exact final-review button hasn't been captured for every job variant.
 - Assumes job-specific questions are always select2 dropdowns (true for every job seen so far); a radio-button-based job-specific question would need a new handler.
 - `fetch_otp_from_gmail` matches on sender `noreply@mail.amazon.jobs` and the phrase `"code on amazon.jobs: <digits>"` — if Amazon changes that email's wording, `OTP_CODE_RE` needs updating; since there's no Discord fallback anymore, a mismatch here means `login()` raises instead of degrading gracefully.
+
+
+
